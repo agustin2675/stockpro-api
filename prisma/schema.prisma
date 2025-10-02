@@ -1,0 +1,159 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Insumo{
+  id Int @id @default(autoincrement())
+  nombre String
+  activo Boolean
+
+
+  unidadDeMedida UnidadDeMedida? @relation(fields: [unidadDeMedida_id], references: [id])
+  unidadDeMedida_id Int?
+
+  rubro Rubro? @relation(fields: [rubro_id], references: [id])
+  rubro_id Int?
+
+  detallePedidos DetallePedido[]
+  sucursalInsumos SucursalInsumo[]
+}
+
+model UnidadDeMedida{
+  id Int @id @default(autoincrement())
+  nombre String
+  activo Boolean @default(true)
+
+  insumos Insumo[]
+}
+
+model Rubro{
+  id Int @id @default(autoincrement())
+  nombre String
+  activo Boolean
+
+  insumos Insumo[]
+  
+}
+
+model TipoStock{
+  id Int @id @default(autoincrement())
+  nombre String
+  activo Boolean
+
+  detallePedidos DetallePedido[]
+  disponibilidadStockSucursales DisponibilidadStockSucursal[]
+  sucursalInsumo SucursalInsumo[]
+}
+
+model Pedido{
+  id Int @id @default(autoincrement())
+  fecha DateTime
+  estado Estado
+
+
+
+  sucursal Sucursal @relation(fields: [sucursal_id], references: [id])
+  sucursal_id Int
+
+  detallePedidos DetallePedido[] 
+  @@unique([fecha, sucursal_id])
+}
+
+model DetallePedido{
+  id Int @id @default(autoincrement())
+  cantidadPedido Int
+  cantidadReal Int
+
+  pedido Pedido @relation(fields: [pedido_id], references: [id], onDelete: Cascade)
+  pedido_id Int
+
+  insumo Insumo @relation(fields: [insumo_id], references: [id])
+  insumo_id Int
+
+  tipoStock TipoStock @relation(fields: [tipoStock_id], references: [id])
+  tipoStock_id Int
+
+  @@unique([pedido_id, insumo_id, tipoStock_id])
+}
+
+enum Estado{
+  BORRADOR
+  APROBADO
+  ENVIADO_A_PROD
+}
+
+model DisponibilidadStockSucursal{
+  id Int @id @default(autoincrement())
+  diaSemana Int
+
+  sucursal Sucursal @relation(fields: [sucursal_id], references: [id])
+  sucursal_id Int
+
+  tipoStock TipoStock @relation(fields: [tipoStock_id], references: [id])
+  tipoStock_id Int
+
+  @@unique([sucursal_id, tipoStock_id, diaSemana])
+}
+
+model Usuario{
+  id Int @id @default(autoincrement())
+  nombre String
+  password String
+  telefono String
+  activo Boolean
+  rol Rol
+
+  sucursal Sucursal @relation(fields: [sucursal_id], references: [id])
+  sucursal_id Int
+
+}
+
+enum Rol{
+  ADMIN
+  SUCURSAL
+  DESPACHO
+  ENCARGADO_PEDIDO
+}
+
+model Sucursal{
+  id Int @id @default(autoincrement())
+  nombre String
+  direccion String
+  telefono String
+  activo Boolean
+
+  pedidos Pedido[]
+  disponibilidadStockSucursales DisponibilidadStockSucursal[]
+  usuarios Usuario[]
+  sucursalInsumos SucursalInsumo[]
+}
+
+model SucursalInsumo{
+  id Int @id @default(autoincrement())
+  cantidadReal Int
+  cantidadIdeal Int
+  cantidadMinima Int @default(0)
+
+  sucursal Sucursal @relation(fields: [sucursal_id], references: [id])
+  sucursal_id Int
+
+  insumo Insumo @relation(fields: [insumo_id], references: [id])
+  insumo_id Int
+
+  tipoStock TipoStock @relation(fields: [tipoStock_id], references: [id])
+  tipoStock_id Int
+
+  @@unique([sucursal_id, tipoStock_id, insumo_id])
+}
