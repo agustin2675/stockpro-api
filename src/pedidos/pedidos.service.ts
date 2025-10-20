@@ -1,8 +1,7 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
-import { CreatePedidoDto } from './dto/create-pedido.dto';
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { CreatePedidoDto, DetallePedidoDto } from './dto/create-pedido.dto';
 import { UpdatePedidoDto } from './dto/update-pedido.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { Estado } from 'generated/prisma';
 import PDFDocument from 'pdfkit'
 import * as fs from 'fs/promises';
 import * as path from 'path'
@@ -32,15 +31,19 @@ export class PedidosService {
     if (!sucInsumo) {
       throw new Error(`No existe sucursalInsumo para insumo ${detalle.insumo_id}`);
     }
-    const cantidadPedido = detalle.cantidadPedido > sucInsumo.cantidadMinima ? detalle.cantidadPedido : 0;
+    const cantidadPedido = detalle.cantidadPedido >= sucInsumo.cantidadMinima ? detalle.cantidadPedido : 0;
 
     return {
       cantidadPedido,
-      cantidadReal: sucInsumo.cantidadReal,
+      cantidadReal: detalle.cantidadReal,
+      cantidadIdeal: detalle.cantidadIdeal,
       insumo: { connect: { id: detalle.insumo_id } },
       tipoStock: { connect: { id: detalle.tipoStock_id } }
     };
   });
+
+  await this.syncCantidadIdealSucursalInsumo(sucursal_id, detalles);
+
 
   // 3. Crear el pedido con sus detalles ya calculados
   return this.prismaService.pedido.create({
@@ -54,6 +57,33 @@ export class PedidosService {
     }
   });
   }
+
+ private async syncCantidadIdealSucursalInsumo(sucursal_id: number, detalles: DetallePedidoDto[]) {
+  const updates = detalles
+    .filter(d => d.cantidadIdeal !== undefined && d.cantidadIdeal !== null)
+    .map(d =>
+      this.prismaService.sucursalInsumo.upsert({
+        where: {
+          sucursal_id_tipoStock_id_insumo_id: {
+            sucursal_id,
+            tipoStock_id: d.tipoStock_id,
+            insumo_id: d.insumo_id,
+          },
+        },
+        update: { cantidadIdeal: Number(d.cantidadIdeal) },
+        create: {
+          sucursal_id,
+          tipoStock_id: d.tipoStock_id,
+          insumo_id: d.insumo_id,
+          cantidadIdeal: Number(d.cantidadIdeal),
+          cantidadReal: 0,
+          cantidadMinima: 0,
+        },
+      })
+    );
+
+  await Promise.all(updates);
+}
 
   findAll() {
     return this.prismaService.pedido.findMany({
@@ -83,33 +113,99 @@ export class PedidosService {
     });
   }
 
-  update(id: number, updatePedidoDto: UpdatePedidoDto) {
-    const {sucursal_id, dateTime, detalles} = updatePedidoDto
-    const insumosEntrantes = Array.from(new Set(detalles?.map(d => d.insumo_id)));
-    if(detalles){
-      
-    return this.prismaService.$transaction(async (tx) => {
-    const existe = await tx.pedido.findUnique({ where: { id }, select: { id: true } });
-    if (!existe) throw new NotFoundException('Pedido no encontrado');
+ async update(id: number, updatePedidoDto: UpdatePedidoDto) {
+  const { sucursal_id, dateTime, detalles } = updatePedidoDto;
 
-    // 1) borrar detalles que ya no vienen
-    await tx.detallePedido.deleteMany({
-      where: {
-        pedido_id: id,
-        NOT: { insumo_id: { in: insumosEntrantes.length ? insumosEntrantes : [-1] } },
-      },
+  return this.prismaService.$transaction(async (tx) => {
+    const pedido = await tx.pedido.findUnique({
+      where: { id },
+      select: { id: true, sucursal_id: true },
     });
+    if (!pedido) throw new NotFoundException('Pedido no encontrado');
 
-    // 2) upsert de cada insumo entrante
-    for (const d of detalles) {
-      await tx.detallePedido.upsert({
-        where: { pedido_id_insumo_id_tipoStock_id: { pedido_id: id, insumo_id: d.insumo_id, tipoStock_id: d.tipoStock_id } },
-        create: { pedido_id: id, insumo_id: d.insumo_id, tipoStock_id: d.tipoStock_id, cantidadPedido: d.cantidadPedido, cantidadReal: d.cantidadReal },
-        update: { cantidadPedido: d.cantidadPedido, cantidadReal: d.cantidadReal },
+    // Si no vienen detalles, opcionalmente actualizamos fecha/sucursal y devolvemos
+    if (!detalles || detalles.length === 0) {
+      if (dateTime || sucursal_id) {
+        await tx.pedido.update({
+          where: { id },
+          data: {
+            ...(dateTime ? { fecha: dateTime } : {}),
+            ...(sucursal_id ? { sucursal_id } : {}),
+          },
+        });
+      }
+      return tx.pedido.findUnique({
+        where: { id },
+        include: { detallePedidos: { include: { insumo: true } }, sucursal: true },
       });
     }
 
-    // 3) devolver actualizado
+    const sucursalParaBuscar = sucursal_id ?? pedido.sucursal_id;
+
+    // Traemos SucursalInsumo para los insumos entrantes
+    const insumosEntrantes = Array.from(new Set(detalles.map(d => d.insumo_id)));
+    const sucInsumos = await tx.sucursalInsumo.findMany({
+      where: {
+        sucursal_id: sucursalParaBuscar,
+        insumo_id: { in: insumosEntrantes.length ? insumosEntrantes : [-1] },
+      },
+      select: {
+        insumo_id: true,
+        cantidadReal: true,
+        cantidadMinima: true,
+      },
+    });
+    const mapaSucInsumo = new Map(sucInsumos.map(si => [si.insumo_id, si]));
+
+    // Upsert SOLO de lo que viene (no borramos lo que no viene)
+    for (const d of detalles) {
+      const si = mapaSucInsumo.get(d.insumo_id);
+      if (!si) {
+        throw new Error(
+          `No existe SucursalInsumo para insumo_id=${d.insumo_id} en sucursal_id=${sucursalParaBuscar}`
+        );
+      }
+
+      //const resta = si.cantidadReal - si.cantidadIdeal;
+      const cantidadPedido = d.cantidadPedido >= si.cantidadMinima ? d.cantidadPedido : 0;
+
+      await tx.detallePedido.upsert({
+        where: {
+          pedido_id_insumo_id_tipoStock_id: {
+            pedido_id: id,
+            insumo_id: d.insumo_id,
+            tipoStock_id: d.tipoStock_id,
+          },
+        },
+        create: {
+          pedido_id: id,
+          insumo_id: d.insumo_id,
+          tipoStock_id: d.tipoStock_id,
+          cantidadPedido,               // calculado desde SucursalInsumo
+          cantidadReal: d.cantidadReal, // tomado de SucursalInsumo
+          cantidadIdeal: d.cantidadIdeal 
+        },
+        update: {
+          cantidadPedido,               // recalculado siempre
+          cantidadReal: d.cantidadReal,
+          cantidadIdeal: d.cantidadIdeal
+        },
+      });
+    }
+
+    // Actualizamos meta (fecha/sucursal) si vino algo
+    if (dateTime || sucursal_id) {
+      await tx.pedido.update({
+        where: { id },
+        data: {
+          ...(dateTime ? { fecha: dateTime } : {}),
+          ...(sucursal_id ? { sucursal_id } : {}),
+        },
+      });
+    }
+    await this.syncCantidadIdealSucursalInsumo(sucursalParaBuscar, detalles);
+
+    // Devolvemos el pedido actualizado
     return tx.pedido.findUnique({
       where: { id },
       include: {
@@ -118,8 +214,7 @@ export class PedidosService {
       },
     });
   });
-    }
-  }
+}
 
   async remove(id: number) {
     return await this.prismaService.pedido.delete({ where: { id } });
@@ -293,253 +388,185 @@ async generateStockPdfById(pedidoId: number): Promise<Buffer> {
 }
 
 async generatePedidoPdfById(pedidoId: number): Promise<Buffer> {
-    // 1) Traer datos completos
-    const pedido = await this.prismaService.pedido.findUnique({
-      where: { id: pedidoId },
-      include: {
-        sucursal: true,
-        detallePedidos: {
-          include: {
-            insumo: {
-              include: {
-                unidadDeMedida: true,
-                rubro: true,
-              },
-            },
-            tipoStock: true,
-          },
-          orderBy: { id: 'asc' },
+  // 1) Datos
+  const pedido = await this.prismaService.pedido.findUnique({
+    where: { id: pedidoId },
+    include: {
+      sucursal: true,
+      detallePedidos: {
+        include: {
+          insumo: { include: { unidadDeMedida: true, rubro: true } },
+          tipoStock: true,
         },
+        orderBy: { id: 'asc' },
       },
-    });
+    },
+  });
+  if (!pedido) throw new Error(`Pedido ${pedidoId} no encontrado`);
 
-    if (!pedido) {
-      throw new Error(`Pedido ${pedidoId} no encontrado`);
-    }
-
-    // 2) Agrupar: TipoStock -> Rubro -> Detalles
-    type Item = (typeof pedido.detallePedidos)[number];
-    const grouped: Record<
-      string,
-      Record<string, Item[]>
-    > = {}; // { [tipoStock]: { [rubro]: Item[] } }
-
-    for (const det of pedido.detallePedidos) {
-      const tipo = det.tipoStock?.nombre ?? 'Sin tipo';
-      const rubro = det.insumo?.rubro?.nombre ?? 'Sin rubro';
-      if (!grouped[tipo]) grouped[tipo] = {};
-      if (!grouped[tipo][rubro]) grouped[tipo][rubro] = [];
-      grouped[tipo][rubro].push(det);
-    }
-
-    // 3) Crear PDF en memoria
-    const doc = new PDFDocument({
-      size: 'A4',
-      margins: { top: 56, left: 46, right: 46, bottom: 56 },
-      bufferPages: true,
-    });
-
-    const chunks: Buffer[] = [];
-    const stream = doc.on('data', (c: Buffer) => chunks.push(c));
-
-    // --- Helpers de layout ---
-    const pageWidth = doc.page.width;
-    const contentWidth = pageWidth - doc.page.margins.left - doc.page.margins.right;
-
-    const drawHr = (yOffset = 8) => {
-      const { x, y } = doc;
-      doc
-        .moveTo(doc.page.margins.left, y + yOffset)
-        .lineTo(pageWidth - doc.page.margins.right, y + yOffset)
-        .lineWidth(0.5)
-        .strokeColor('#E5E7EB')
-        .stroke();
-      doc.moveDown(1);
-    };
-
-    const ensureSpace = (needed = 80) => {
-      if (doc.y + needed > doc.page.height - doc.page.margins.bottom) {
-        doc.addPage();
-      }
-    };
-
-    const fmtDateDDMMYYYY = (d: Date) => {
-      const dd = String(d.getDate()).padStart(2, '0');
-      const mm = String(d.getMonth() + 1).padStart(2, '0');
-      const yyyy = d.getFullYear();
-      return `${dd}/${mm}/${yyyy}`;
-    };
-
-    // Tabla simple con salto de página automático
-    const drawTable = (
-      rows: Array<{ nombre: string; unidad: string; pedido: number }>,
-      colPercents = [60, 20, 20] as [number, number, number]
-    ) => {
-      const [c1, c2, c3] = colPercents.map((p) => Math.floor((p / 100) * contentWidth));
-      const rowHeight = 22;
-
-      // Header
-      ensureSpace(60);
-      doc
-        .font('Helvetica-Bold')
-        .fontSize(10)
-        .fillColor('#111827');
-
-      const xStart = doc.page.margins.left;
-      const yStart = doc.y + 6;
-
-      doc
-        .rect(xStart, yStart, contentWidth, rowHeight)
-        .fillOpacity(1)
-        .fill('#F9FAFB');
-
-      doc
-        .fillColor('#111827')
-        .text('Nombre', xStart + 10, yStart + 6, { width: c1 - 12 })
-        .text('Unidad', xStart + c1 + 10, yStart + 6, { width: c2 - 12 })
-        .text('Pedido', xStart + c1 + c2 + 10, yStart + 6, { width: c3 - 12, align: 'right' });
-
-      doc.moveTo(xStart, yStart + rowHeight).lineTo(xStart + contentWidth, yStart + rowHeight).lineWidth(0.5).strokeColor('#E5E7EB').stroke();
-
-      // Rows
-      let y = yStart + rowHeight;
-      doc.font('Helvetica').fontSize(10).fillColor('#111827');
-
-      for (const r of rows) {
-        // salto de página si no entra la fila
-        if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
-          doc.addPage();
-          y = doc.y;
-          // redibujar header en nueva página
-          doc.font('Helvetica-Bold').fontSize(10);
-          const yH = y + 6;
-          doc
-            .rect(xStart, yH, contentWidth, rowHeight)
-            .fillOpacity(1)
-            .fill('#F9FAFB');
-          doc
-            .fillColor('#111827')
-            .text('Nombre', xStart + 10, yH + 6, { width: c1 - 12 })
-            .text('Unidad', xStart + c1 + 10, yH + 6, { width: c2 - 12 })
-            .text('Pedido', xStart + c1 + c2 + 10, yH + 6, { width: c3 - 12, align: 'right' });
-          doc.moveTo(xStart, yH + rowHeight).lineTo(xStart + contentWidth, yH + rowHeight).lineWidth(0.5).strokeColor('#E5E7EB').stroke();
-          y = yH + rowHeight;
-          doc.font('Helvetica').fontSize(10).fillColor('#111827');
-        }
-
-        // fila
-        doc
-          .fillOpacity(1)
-          .rect(xStart, y, contentWidth, rowHeight)
-          .fill('#FFFFFF');
-
-        doc
-          .fillColor('#111827')
-          .text(r.nombre, xStart + 10, y + 6, { width: c1 - 12 })
-          .text(r.unidad, xStart + c1 + 10, y + 6, { width: c2 - 12 })
-          .text(String(r.pedido), xStart + c1 + c2 + 10, y + 6, { width: c3 - 12, align: 'right' });
-
-        // línea inferior
-        doc
-          .moveTo(xStart, y + rowHeight)
-          .lineTo(xStart + contentWidth, y + rowHeight)
-          .lineWidth(0.5)
-          .strokeColor('#E5E7EB')
-          .stroke();
-
-        y += rowHeight;
-      }
-
-      doc.y = y + 10;
-    };
-
-    // --- Encabezado ---
-    doc.font('Helvetica-Bold').fontSize(18).fillColor('#111827').text(`Pedido ${pedido.id}`, {
-      align: 'left',
-    });
-    doc.moveDown(0.2);
-
-    doc.font('Helvetica').fontSize(10).fillColor('#374151');
-    const fechaStr = fmtDateDDMMYYYY(new Date(pedido.fecha));
-    const sucursalNombre = pedido.sucursal?.nombre ?? '—';
-    doc.text(`Sucursal: ${sucursalNombre}    Fecha: ${fechaStr}`);
-    drawHr(8);
-
-    // 4) Render: por cada TipoStock y Rubro
-    for (const tipoStock of Object.keys(grouped)) {
-      ensureSpace(60);
-
-      // “Píldora”/header tipo stock (fondo beige claro)
-      const yTop = doc.y + 6;
-      doc
-        .rect(doc.page.margins.left, yTop, contentWidth, 24)
-        .fillOpacity(1)
-        .fill('#EEE7D9');
-      doc
-        .fillColor('#111827')
-        .font('Helvetica-Bold')
-        .fontSize(12)
-        .text(tipoStock, doc.page.margins.left + 10, yTop + 6);
-
-      doc.moveDown(2);
-
-      const rubros = grouped[tipoStock];
-      for (const rubro of Object.keys(rubros)) {
-        ensureSpace(50);
-
-        // Subtítulo de Rubro
-        doc
-          .font('Helvetica-Bold')
-          .fontSize(14)
-          .fillColor('#111827')
-          .text(rubro);
-        doc.moveDown(0.5);
-
-        // Tabla
-        const rows = rubros[rubro]
-          .filter((d) => (d.cantidadPedido ?? 0) > 0) // si querés mostrar solo los que piden > 0
-          .map((d) => ({
-            nombre: d.insumo?.nombre ?? '—',
-            unidad: d.insumo?.unidadDeMedida?.nombre ?? '—',
-            pedido: d.cantidadPedido ?? 0,
-          }));
-
-        // Si rubro no tiene filas (p. ej. todos 0), igual podés mostrar tabla vacía o saltear:
-        if (rows.length === 0) {
-          doc.font('Helvetica-Oblique').fontSize(10).fillColor('#6B7280').text('Sin items.');
-          doc.moveDown(0.6);
-          continue;
-        }
-
-        drawTable(rows);
-        doc.moveDown(0.6);
-      }
-
-      doc.moveDown(0.6);
-    }
-
-    // Pie de página opcional (número de página)
-    const pageCount = doc.bufferedPageRange().count;
-    for (let i = 0; i < pageCount; i++) {
-      doc.switchToPage(i);
-      const footerY = doc.page.height - doc.page.margins.bottom + 18;
-      doc.font('Helvetica').fontSize(9).fillColor('#9CA3AF');
-      doc.text(
-        `Página ${i + 1} de ${pageCount}`,
-        doc.page.margins.left,
-        footerY,
-        { width: contentWidth, align: 'right' },
-      );
-    }
-
-    doc.end();
-
-    // 5) Devolver buffer
-    return await new Promise<Buffer>((resolve, reject) => {
-      stream.on('end', () => resolve(Buffer.concat(chunks)));
-      doc.on('error', reject);
-    });
+  // 2) Agrupar TipoStock -> Rubro
+  type Item = (typeof pedido.detallePedidos)[number];
+  const grouped: Record<string, Record<string, Item[]>> = {};
+  for (const det of pedido.detallePedidos) {
+    const tipo = det.tipoStock?.nombre ?? 'Sin tipo';
+    const rubro = det.insumo?.rubro?.nombre ?? 'Sin rubro';
+    if (!grouped[tipo]) grouped[tipo] = {};
+    if (!grouped[tipo][rubro]) grouped[tipo][rubro] = [];
+    grouped[tipo][rubro].push(det);
   }
+
+  // === Config térmica 80mm ===
+  const WIDTH_PT = 226.77;        // 80 mm
+  const PROV_HEIGHT = 4000;       // alto grande; se recorta al final
+  const MARGIN = 8;               // márgenes chicos
+  const LINE_H = 18;              // alto fila
+
+  const doc = new PDFDocument({
+    size: [WIDTH_PT, PROV_HEIGHT],
+    margins: { top: MARGIN, left: MARGIN, right: MARGIN, bottom: MARGIN },
+    bufferPages: false,
+  });
+
+  const chunks: Buffer[] = [];
+  doc.on('data', (c: Buffer) => chunks.push(c));
+
+  const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+  // === Helpers ===
+  const hr = () => {
+    const y = doc.y + 2;
+    doc
+      .moveTo(doc.page.margins.left, y)
+      .lineTo(doc.page.margins.left + contentWidth, y)
+      .lineWidth(0.5)
+      .strokeColor('#000')
+      .stroke();
+    doc.moveDown(0.5);
+  };
+
+  const fmtDate = (d: Date) => {
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const yyyy = d.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  };
+
+  const truncToWidth = (text: string, maxWidth: number) => {
+    if (!text) return '';
+    const ell = '…';
+    if (doc.widthOfString(text) <= maxWidth) return text;
+    let lo = 0, hi = text.length;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const s = text.slice(0, mid) + ell;
+      if (doc.widthOfString(s) <= maxWidth) lo = mid + 1; else hi = mid;
+    }
+    return text.slice(0, Math.max(0, lo - 1)) + ell;
+  };
+
+  const drawTitleOneLine = (text: string, opts: { level: 2 | 3; topGap?: number; bottomGap?: number }) => {
+    const { level, topGap = 2, bottomGap = 2 } = opts;
+    const size = level === 2 ? 13 : 12;
+    const t = String(text ?? '').replace(/\s+/g, ' ').trim();
+    if (topGap) doc.moveDown(topGap / 10);
+    doc.font('Helvetica-Bold').fontSize(size).fillColor('#000');
+    // dibuja 1 línea con ellipsis dentro del ancho disponible
+    const y0 = doc.y;
+    const oneLine = truncToWidth(t, contentWidth);
+    doc.text(oneLine, doc.page.margins.left, y0, { width: contentWidth, height: size + 4 });
+    doc.y = y0 + size + 2;
+    if (bottomGap) doc.moveDown(bottomGap / 10);
+  };
+
+  const drawH1 = (txt: string) => {
+    doc.font('Helvetica-Bold').fontSize(16).fillColor('#000').text(txt, { align: 'left' });
+  };
+
+  const drawTable = (rows: Array<{ nombre: string; um: string; ped: number }>) => {
+    // Nombre 62% | UM 18% | Ped 20%
+    const c1 = Math.floor(contentWidth * 0.62);
+    const c2 = Math.floor(contentWidth * 0.18);
+    const c3 = contentWidth - c1 - c2;
+    const x0 = doc.page.margins.left;
+
+    // Header
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#000');
+    const yHeader = doc.y;
+    doc.text('Nombre', x0, yHeader, { width: c1 });
+    doc.text('UM',     x0 + c1, yHeader, { width: c2 });
+    doc.text('Ped',    x0 + c1 + c2, yHeader, { width: c3, align: 'right' });
+    doc.y = yHeader + LINE_H - 6;
+    hr();
+
+    // Filas
+    doc.font('Helvetica').fontSize(11).fillColor('#000');
+    for (const r of rows) {
+      const y = doc.y;
+      const nombre = truncToWidth(r.nombre, c1 - 2);
+      const um = truncToWidth(r.um, c2 - 2);
+      const ped = String(r.ped ?? 0);
+
+      doc.text(nombre, x0, y, { width: c1, height: LINE_H });
+      doc.text(um, x0 + c1, y, { width: c2, height: LINE_H });
+      doc.text(ped, x0 + c1 + c2, y, { width: c3, height: LINE_H, align: 'right' });
+
+      doc.y = y + LINE_H - 4;
+    }
+    doc.moveDown(0.3);
+  };
+
+  // === Encabezado ===
+  drawH1(`Pedido ${pedido.id}`);
+  const fechaStr = fmtDate(new Date(pedido.fecha));
+  const sucursalNombre = pedido.sucursal?.nombre ?? '—';
+  doc.font('Helvetica').fontSize(10).fillColor('#000')
+     .text(`Sucursal: ${sucursalNombre}`)
+     .text(`Fecha: ${fechaStr}`);
+  hr();
+
+  // === Contenido ===
+  for (const tipo of Object.keys(grouped)) {
+    drawTitleOneLine(tipo, { level: 2, topGap: 4, bottomGap: 3 });
+
+    const rubros = grouped[tipo];
+    for (const rubro of Object.keys(rubros)) {
+      drawTitleOneLine(rubro, { level: 3, topGap: 2, bottomGap: 2 });
+
+      const rows = rubros[rubro]
+        .filter(d => (d.cantidadPedido ?? 0) > 0)
+        .map(d => ({
+          nombre: d.insumo?.nombre ?? '—',
+          um: d.insumo?.unidadDeMedida?.nombre ?? '—',
+          ped: d.cantidadPedido ?? 0,
+        }));
+
+      if (!rows.length) {
+        doc.font('Helvetica-Oblique').fontSize(10).text('Sin ítems.');
+        doc.moveDown(0.4);
+        continue;
+      }
+
+      doc.moveDown(0.2);
+      drawTable(rows);
+
+      // separador fino entre rubros
+      doc.moveDown(0.2);
+      hr();
+    }
+  }
+
+  // === Recorte a una sola página ===
+  const finalHeight = Math.max(Math.ceil(doc.y + MARGIN), 120);
+  doc.page.height = finalHeight;
+
+  doc.end();
+
+  // 3) Buffer
+  return await new Promise<Buffer>((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+}
 
 
 async generarYPersistirPDF(pedidoId: number) {
@@ -552,7 +579,7 @@ async generarYPersistirPDF(pedidoId: number) {
     throw new Error(`Pedido ${pedidoId} no encontrado`);
   }
 
-  const bufferStock = await this.generateStockPdfById(pedidoId);
+  //const bufferStock = await this.generateStockPdfById(pedidoId);
   const bufferPedido = await this.generatePedidoPdfById(pedidoId);
 
   // Armar fecha DDMMYYYY
@@ -579,12 +606,12 @@ async generarYPersistirPDF(pedidoId: number) {
   const filePathPedido = path.join(folderPath, fileNamePedido);
 
   // Guardar el archivo en disco
-  await fs.writeFile(filePathStock, bufferStock);
+  //await fs.writeFile(filePathStock, bufferStock);
   
   await fs.writeFile(filePathPedido, bufferPedido);
 
 
- await this.sendWsp(process.env.WSP_REPORTE,filePathStock)
+ //await this.sendWsp(process.env.WSP_REPORTE,filePathStock)
  await this.sendWsp(process.env.WSP_REPORTE,filePathPedido)
 }
 

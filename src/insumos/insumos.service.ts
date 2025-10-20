@@ -75,7 +75,10 @@ export class InsumosService {
 
   // --- LIST ---
   listSucursalInsumo(where?: { sucursal_id?: number; insumo_id?: number; tipoStock_id?: number }) {
-    const w: any = {};
+ const w: any = {
+    insumo:   { activo: true },   // ✅ solo insumos activos
+    tipoStock:{ activo: true },   // ✅ solo tipos de stock activos
+  };
     if (where?.sucursal_id !== undefined) w.sucursal_id = Number(where.sucursal_id);
     if (where?.insumo_id !== undefined) w.insumo_id = Number(where.insumo_id);
     if (where?.tipoStock_id !== undefined) w.tipoStock_id = Number(where.tipoStock_id);
@@ -89,10 +92,17 @@ export class InsumosService {
 
   // --- GET BY ID ---
   getSucursalInsumoById(id: number) {
-    return this.prismaService.sucursalInsumo.findUnique({
-      where: { id },
-      include: { sucursal: true, insumo: true, tipoStock: true },
-    });
+    return this.prismaService.sucursalInsumo.findFirst({
+    where: {
+      id,
+      insumo: { activo: true }, // filtra por insumos activos
+    },
+    include: {
+      sucursal: true,
+      insumo: true,
+      tipoStock: true,
+    },
+  });
   }
 
   // --- UPDATE ---

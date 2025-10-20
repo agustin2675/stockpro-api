@@ -12,6 +12,9 @@ export class DetallePedidoDto {
 
   @ApiProperty({ type: Number, example: 5 })
   cantidadReal: number;
+
+  @ApiProperty({ type: Number, example: 5 })
+  cantidadIdeal: number;
 }
 
 @ApiExtraModels(DetallePedidoDto)

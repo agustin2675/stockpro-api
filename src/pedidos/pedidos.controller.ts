@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, Req, Put, Res, StreamableFile } from '@nestjs/common';
+import { Controller, Get, Post, Body, Patch, Param, Delete, Req, Put, StreamableFile, Res } from '@nestjs/common';
 import { PedidosService } from './pedidos.service';
 import { CreatePedidoDto } from './dto/create-pedido.dto';
 import { UpdatePedidoDto } from './dto/update-pedido.dto';
 import { ApiTags } from '@nestjs/swagger';
+import { Response } from 'express';
 
 @ApiTags('pedidos')
 @Controller('pedidos')
@@ -15,6 +16,15 @@ export class PedidosController {
     await this.pedidosService.generarYPersistirPDF(pedido.id);
     return pedido
   }
+
+@Get('imprimir/:id')
+async print(@Param('id') id: string): Promise<StreamableFile> {
+  const buffer = await this.pedidosService.generatePedidoPdfById(+id);
+  return new StreamableFile(buffer, {
+    type: 'application/pdf',
+    disposition: `inline; filename=pedido_${id}.pdf`,
+  });
+}
 
   @Get()
   async findAll(
@@ -29,8 +39,10 @@ export class PedidosController {
   }
   
   @Put(':id')
-  update(@Param('id') id: string, @Body() body: any) {
-    return this.pedidosService.update(Number(id), body);
+  async update(@Param('id') id: string, @Body() body: any) {
+    await this.pedidosService.update(Number(id), body)
+    return await this.pedidosService.generarYPersistirPDF(Number(id));
+    ;
   }
 
   @Delete(':id')

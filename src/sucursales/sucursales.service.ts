@@ -87,7 +87,9 @@ async addDisponibilidad(addDisponibilidadDto: AddDisponibilidadStockSucursalDto)
   
   // =========== LISTAR (con filtros opcionales) ===========
   async listDisponibilidad(params?: { sucursal_id?: number; tipoStock_id?: number }) {
-    const where: any = {};
+    const where: any = {
+          tipoStock: { activo: true }, // ✅ solo tipoStock activos
+    };
     if (params?.sucursal_id) where.sucursal_id = params.sucursal_id;
     if (params?.tipoStock_id) where.tipoStock_id = params.tipoStock_id;
 
@@ -101,19 +103,25 @@ async addDisponibilidad(addDisponibilidadDto: AddDisponibilidadStockSucursalDto)
     });
   }
 
-  // =========== OBTENER POR SUCURSAL + TIPO ===========
-  async getDisponibilidadForSucursalTipo(sucursalId: number, tipoStockId: number) {
-    const registros = await this.prismaService.disponibilidadStockSucursal.findMany({
-      where: { sucursal_id: sucursalId, tipoStock_id: tipoStockId },
-      orderBy: { diaSemana: 'asc' },
-    });
-    return {
+// =========== OBTENER POR SUCURSAL + TIPO (solo tipoStock activo) ===========
+async getDisponibilidadForSucursalTipo(sucursalId: number, tipoStockId: number) {
+  const registros = await this.prismaService.disponibilidadStockSucursal.findMany({
+    where: {
       sucursal_id: sucursalId,
       tipoStock_id: tipoStockId,
-      diasSemana: registros.map((r) => r.diaSemana),
-      registros,
-    };
-  }
+      tipoStock: { activo: true }, // <-- filtra por tipoStock activo
+    },
+    orderBy: { diaSemana: 'asc' },
+    include: { tipoStock: true },
+  });
+
+  return {
+    sucursal_id: sucursalId,
+    tipoStock_id: tipoStockId,
+    diasSemana: registros.map((r) => r.diaSemana),
+    registros,
+  };
+}
 
   // =========== UPDATE POR ID ===========
   async updateDisponibilidad(id: number, dto: UpdateDisponibilidadStockSucursalDto) {
