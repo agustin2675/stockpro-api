@@ -415,11 +415,12 @@ async generatePedidoPdfById(pedidoId: number): Promise<Buffer> {
     grouped[tipo][rubro].push(det);
   }
 
-  // === Config térmica 80mm ===
-  const WIDTH_PT = 226.77;        // 80 mm
-  const PROV_HEIGHT = 4000;       // alto grande; se recorta al final
-  const MARGIN = 8;               // márgenes chicos
-  const LINE_H = 18;              // alto fila
+// === Config térmica 72mm ===
+const WIDTH_PT = 204.09;      // 72 mm
+const PROV_HEIGHT = 4000;     // alto grande; se recorta al final
+const MARGIN = 8;             // márgenes chicos
+const LINE_H = 18;            // alto de línea
+
 
   const doc = new PDFDocument({
     size: [WIDTH_PT, PROV_HEIGHT],
